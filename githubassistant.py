@@ -119,15 +119,35 @@ def scan_for_secrets(content: str, source_label: str) -> None:
 
 
 def confirm_step(title: str, details: list[str]) -> None:
-    """Display what is about to happen and require explicit user confirmation."""
-    console.print()
-    body = "\n".join(f"  {d}" for d in details)
-    console.print(
-        Panel(body, title=f"[bold cyan]Next step: {title}[/bold cyan]", border_style="cyan")
-    )
-    if not Confirm.ask("  Proceed with this step?"):
-        console.print("[yellow]Aborted by user.[/yellow]")
-        sys.exit(0)
+    """
+    Display what is about to happen and require explicit user confirmation.
+    If the user declines, offer to retry (re-read the step) or abort entirely.
+    Loops until the user either confirms or explicitly chooses to abort.
+    """
+    while True:
+        console.print()
+        body = "\n".join(f"  {d}" for d in details)
+        console.print(
+            Panel(body, title=f"[bold cyan]Next step: {title}[/bold cyan]", border_style="cyan")
+        )
+
+        if Confirm.ask("  Proceed with this step?"):
+            return  # User confirmed — carry on
+
+        # User pressed n — offer options instead of exiting immediately
+        console.print()
+        console.print("  [yellow]What would you like to do?[/yellow]")
+        console.print("    [bold]r[/bold] — Review this step again")
+        console.print("    [bold]a[/bold] — Abort the entire script")
+        console.print()
+
+        while True:
+            choice = Prompt.ask("  Your choice", choices=["r", "a"], default="r")
+            if choice == "r":
+                break   # Loop back and show the step panel again
+            if choice == "a":
+                console.print("[yellow]Aborted by user.[/yellow]")
+                sys.exit(0)
 
 
 def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
