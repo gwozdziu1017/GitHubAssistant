@@ -134,8 +134,15 @@ def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run a gh CLI command and return the result."""
     result = subprocess.run(["gh", *args], capture_output=True, text=True)
     if check and result.returncode != 0:
-        console.print(f"[red]✗ gh {' '.join(args)} failed[/red]")
-        console.print(f"[red]{result.stderr.strip()}[/red]")
+        stderr = result.stderr.strip() or result.stdout.strip() or "No error details available."
+        console.print(
+            Panel(
+                f"[red]Command:[/red] gh {' '.join(args)}\n\n"
+                f"[red]Error:[/red] {stderr}",
+                title="[bold red]✗ GitHub CLI error[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
     return result
 
@@ -156,16 +163,42 @@ def gh_graphql(query: str) -> dict:
 
 def check_prerequisites() -> None:
     if not ANTHROPIC_API_KEY:
-        console.print("[red]✗ ANTHROPIC_API_KEY not set in .env[/red]")
+        console.print(
+            Panel(
+                "ANTHROPIC_API_KEY is not set.\n\n"
+                "Add it to your shell profile (~/.zshrc or ~/.bashrc):\n"
+                "  export ANTHROPIC_API_KEY=sk-ant-...\n\n"
+                "Then reload your shell:  source ~/.zshrc",
+                title="[bold red]✗ Missing ANTHROPIC_API_KEY[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     if not GITHUB_USERNAME:
-        console.print("[red]✗ GITHUB_USERNAME not set in .env[/red]")
+        console.print(
+            Panel(
+                "GITHUB_USERNAME is not set.\n\n"
+                "Add it to your shell profile (~/.zshrc or ~/.bashrc):\n"
+                "  export GITHUB_USERNAME=your-username\n\n"
+                "Then reload your shell:  source ~/.zshrc",
+                title="[bold red]✗ Missing GITHUB_USERNAME[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if result.returncode != 0:
-        console.print("[red]✗ gh CLI not authenticated — run: gh auth login[/red]")
+        console.print(
+            Panel(
+                "gh CLI is not authenticated.\n\n"
+                "Run:  gh auth login\n\n"
+                f"Details: {result.stderr.strip()}",
+                title="[bold red]✗ GitHub CLI not authenticated[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     console.print("[green]✓ Prerequisites OK[/green]")
@@ -204,7 +237,7 @@ def generate_stories(spec_content: str) -> dict:
 
     message = client.messages.create(
         model="claude-opus-4-8",
-        max_tokens=8096,
+        max_tokens=16000,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -229,10 +262,28 @@ def generate_stories(spec_content: str) -> dict:
         # Fallback: extract the first {...} block
         match = re.search(r"\{.*\}", response_text, re.DOTALL)
         if not match:
-            console.print("[red]✗ Could not parse Claude response as JSON[/red]")
-            console.print(response_text)
+            console.print(
+                Panel(
+                    "Claude did not return valid JSON.\n\n"
+                    "This is unexpected — please try running the script again.",
+                    title="[bold red]✗ Failed to parse Claude response[/bold red]",
+                    border_style="red",
+                )
+            )
             sys.exit(1)
-        data = json.loads(match.group())
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            console.print(
+                Panel(
+                    "Claude's response was cut off before it could finish.\n\n"
+                    "The spec may be too large for a single API call.\n"
+                    "Try splitting the spec into smaller sections and running separately.",
+                    title="[bold red]✗ Claude response truncated[/bold red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
 
     epics = data.get("epics", [])
     stories = data.get("stories", [])
@@ -713,4 +764,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user. Exiting.[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(
+            Panel(
+                f"{type(e).__name__}: {e}\n\n"
+                "If this keeps happening, check your .env / shell config and gh auth status.",
+                title="[bold red]✗ Unexpected error[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
