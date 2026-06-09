@@ -2,6 +2,7 @@
 """GitHubAssistant — Bootstrap a GitHub project from a *_SPEC.md file."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -87,6 +88,49 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("AWS access key",          re.compile(r"\bAKIA[A-Z0-9]{16}")),
     ("Generic high-entropy key",re.compile(r"(?<![a-zA-Z0-9])[A-Za-z0-9+/]{40,}(?![a-zA-Z0-9])")),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Cache — stores Claude API responses keyed by spec content hash
+# ---------------------------------------------------------------------------
+
+CACHE_PATH = Path.home() / ".githubassistant_cache.json"
+
+
+def _spec_hash(spec_content: str) -> str:
+    """Return a SHA-256 hash of the spec content used as cache key."""
+    return hashlib.sha256(spec_content.encode("utf-8")).hexdigest()
+
+
+def load_cache() -> dict:
+    """Load the cache file, returning an empty dict if it doesn't exist."""
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    """Persist the cache dict to disk."""
+    try:
+        CACHE_PATH.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except OSError as e:
+        console.print(f"[yellow]⚠  Could not save cache: {e}[/yellow]")
+
+
+def get_cached_stories(spec_content: str) -> dict | None:
+    """Return cached Claude response for this spec, or None if not cached."""
+    cache = load_cache()
+    return cache.get(_spec_hash(spec_content))
+
+
+def set_cached_stories(spec_content: str, data: dict) -> None:
+    """Store Claude response in cache keyed by spec hash."""
+    cache = load_cache()
+    cache[_spec_hash(spec_content)] = data
+    save_cache(cache)
 
 
 def scan_for_secrets(content: str, source_label: str) -> None:
@@ -251,6 +295,16 @@ def read_spec(spec_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_stories(spec_content: str) -> dict:
+    # Check cache before making an API call
+    cached = get_cached_stories(spec_content)
+    if cached:
+        console.print("[green]✓ Using cached epics and stories (spec unchanged)[/green]")
+        console.print(f"  Epics: {', '.join(cached.get('epics', []))}")
+        console.print(f"  Stories: {len(cached.get('stories', []))} total")
+        if Confirm.ask("  Use cached result? (n = regenerate via API)"):
+            return cached
+        console.print("[yellow]⠸ Regenerating via API...[/yellow]")
+
     console.print("[yellow]⠸ Analysing spec with Claude Opus...[/yellow]")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -310,6 +364,10 @@ def generate_stories(spec_content: str) -> dict:
 
     console.print(f"[green]✓ Epics generated: {', '.join(epics)}[/green]")
     console.print(f"[green]✓ User stories generated: {len(stories)} total[/green]")
+
+    set_cached_stories(spec_content, data)
+    console.print(f"[green]✓ Response cached to {CACHE_PATH}[/green]")
+
     return data
 
 
@@ -349,11 +407,11 @@ def display_plan(spec_path: Path, repo_name: str, data: dict) -> None:
 # Local repository
 # ---------------------------------------------------------------------------
 
-def create_local_repo(repo_name: str) -> Path:
-    repo_path = Path.cwd() / repo_name
+def create_local_repo(repo_name: str, target_dir: Path) -> Path:
+    repo_path = target_dir / repo_name
 
     if repo_path.exists():
-        console.print(f"[yellow]⚠  Directory {repo_name}/ already exists[/yellow]")
+        console.print(f"[yellow]⚠  Directory {repo_path} already exists[/yellow]")
         if not Confirm.ask("Continue anyway?"):
             sys.exit(0)
     else:
@@ -676,7 +734,7 @@ def main() -> None:
     )
     data = generate_stories(spec_content)
 
-    # ── Collect repo name, display plan, final confirmation ─────────────────
+    # ── Collect repo name and target directory ───────────────────────────────
     console.print()
     repo_name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
     if not repo_name:
@@ -689,6 +747,16 @@ def main() -> None:
             "Use letters, numbers, hyphens, underscores, or dots only.[/red]"
         )
         sys.exit(1)
+
+    default_dir = Path.home() / "Coding"
+    raw_dir = Prompt.ask(
+        "[bold]Where should the local repo be created?[/bold]",
+        default=str(default_dir),
+    ).strip()
+    target_dir = Path(raw_dir).expanduser().resolve()
+
+    if not target_dir.exists():
+        console.print(f"[yellow]⚠  Directory {target_dir} does not exist — it will be created[/yellow]")
 
     display_plan(spec_path, repo_name, data)
 
@@ -704,14 +772,14 @@ def main() -> None:
     confirm_step(
         "Create local repository",
         [
-            f"Create directory: ./{repo_name}/",
+            f"Create directory: {target_dir / repo_name}",
             "Initialise git with master as default branch",
             "Create README.md and .gitignore (includes .env rule)",
             "Make initial commit on master",
             "Create dev branch",
         ],
     )
-    repo_path = create_local_repo(repo_name)
+    repo_path = create_local_repo(repo_name, target_dir)
 
     # ── Step 4: remote repository ────────────────────────────────────────────
     confirm_step(
