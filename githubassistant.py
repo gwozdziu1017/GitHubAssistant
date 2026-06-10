@@ -424,19 +424,94 @@ def display_plan(spec_path: Path, repo_name: str, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# State checks — detect what is already done so steps can be skipped
+# ---------------------------------------------------------------------------
+
+def local_repo_exists(repo_name: str, target_dir: Path) -> bool:
+    """Return True if a git repo already exists at target_dir/repo_name."""
+    repo_path = target_dir / repo_name
+    return repo_path.exists() and (repo_path / ".git").exists()
+
+
+def remote_repo_exists(repo_name: str) -> bool:
+    """Return True if the remote GitHub repo already exists."""
+    result = gh("repo", "view", f"{GITHUB_USERNAME}/{repo_name}", check=False)
+    return result.returncode == 0
+
+
+def remote_has_branches(repo_name: str) -> bool:
+    """Return True if master and dev branches are already pushed to remote."""
+    result = gh(
+        "api", f"repos/{GITHUB_USERNAME}/{repo_name}/branches", check=False
+    )
+    if result.returncode != 0:
+        return False
+    branches = {b["name"] for b in json.loads(result.stdout)}
+    return "master" in branches and "dev" in branches
+
+
+def get_existing_project(repo_name: str) -> Optional[dict]:
+    """Return project data dict if a project board named repo_name already exists, else None."""
+    result = gh(
+        "project", "list",
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for project in json.loads(result.stdout).get("projects", []):
+        if project.get("title") == repo_name:
+            return project
+    return None
+
+
+def get_existing_project_fields(project_number: str) -> Tuple[Optional[str], Dict[str, str]]:
+    """
+    Return (status_field_id, option_ids) for an existing project board.
+    option_ids maps column name -> option node ID.
+    """
+    fields_result = gh(
+        "project", "field-list", project_number,
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+    )
+    fields_data = json.loads(fields_result.stdout)
+    for field in fields_data.get("fields", []):
+        if field.get("name") == "Status":
+            option_ids = {opt["name"]: opt["id"] for opt in field.get("options", [])}
+            return field["id"], option_ids
+    return None, {}
+
+
+def repo_has_issues(repo_name: str) -> bool:
+    """Return True if the repo already has at least one issue."""
+    result = gh(
+        "issue", "list",
+        "--repo", f"{GITHUB_USERNAME}/{repo_name}",
+        "--state", "all",
+        "--limit", "1",
+        "--json", "number",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return len(json.loads(result.stdout)) > 0
+
+
+# ---------------------------------------------------------------------------
 # Local repository
 # ---------------------------------------------------------------------------
 
 def create_local_repo(repo_name: str, target_dir: Path) -> Path:
     repo_path = target_dir / repo_name
 
-    if repo_path.exists():
-        console.print(f"[yellow]⚠  Directory {repo_path} already exists[/yellow]")
-        if not Confirm.ask("Continue anyway?"):
-            sys.exit(0)
-    else:
-        repo_path.mkdir(parents=True)
+    # Skip if already initialised
+    if local_repo_exists(repo_name, target_dir):
+        console.print(f"[green]✓ Local repository already exists: {repo_path} — skipping[/green]")
+        return repo_path
 
+    repo_path.mkdir(parents=True, exist_ok=True)
     console.print("[yellow]⠸ Initialising local repository...[/yellow]")
 
     repo = Repo.init(repo_path)
@@ -468,16 +543,19 @@ def create_local_repo(repo_name: str, target_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def create_remote_repo(repo_name: str) -> str:
-    console.print("[yellow]⠸ Creating remote GitHub repository...[/yellow]")
+    repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
 
+    if remote_repo_exists(repo_name):
+        console.print(f"[green]✓ Remote repository already exists: {repo_url} — skipping[/green]")
+        return repo_url
+
+    console.print("[yellow]⠸ Creating remote GitHub repository...[/yellow]")
     gh(
         "repo", "create",
         f"{GITHUB_USERNAME}/{repo_name}",
         f"--{DEFAULT_VISIBILITY}",
         "--description", f"{repo_name} — created by GitHubAssistant",
     )
-
-    repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
     console.print(f"[green]✓ Remote repository created: {repo_url} ({DEFAULT_VISIBILITY})[/green]")
     return repo_url
 
@@ -514,11 +592,18 @@ def verify_gitignore_covers_env(repo_path: Path) -> None:
 
 
 def push_branches(repo_path: Path, repo_name: str) -> None:
+    if remote_has_branches(repo_name):
+        console.print("[green]✓ Branches already pushed to remote — skipping[/green]")
+        return
+
     verify_gitignore_covers_env(repo_path)
 
     repo = Repo(repo_path)
     remote_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}.git"
-    repo.create_remote("origin", remote_url)
+
+    # Add remote only if not already set
+    if "origin" not in [r.name for r in repo.remotes]:
+        repo.create_remote("origin", remote_url)
     console.print("[green]✓ Local connected to remote[/green]")
 
     console.print("[yellow]⠸ Pushing branches...[/yellow]")
@@ -532,12 +617,24 @@ def push_branches(repo_path: Path, repo_name: str) -> None:
 # GitHub Project board (v2)
 # ---------------------------------------------------------------------------
 
-def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
+def create_project_board(repo_name: str) -> Tuple[str, str, str, Dict[str, str]]:
     """
     Create a GitHub Projects v2 board.
     Returns (project_number, project_node_id, status_field_id, option_ids).
     option_ids maps column name -> option node ID.
     """
+    # Skip if board already exists
+    existing = get_existing_project(repo_name)
+    if existing:
+        project_number = str(existing["number"])
+        project_id = existing["id"]
+        console.print(f"[green]✓ Project board already exists: {repo_name} — skipping creation[/green]")
+        status_field_id, option_ids = get_existing_project_fields(project_number)
+        if not status_field_id:
+            console.print("[red]✗ Status field not found in existing project[/red]")
+            sys.exit(1)
+        return project_number, project_id, status_field_id, option_ids
+
     console.print("[yellow]⠸ Creating GitHub Project board...[/yellow]")
 
     result = gh(
@@ -661,6 +758,10 @@ def create_issues(
     status_field_id: str,
     option_ids: dict,
 ) -> None:
+    if repo_has_issues(repo_name):
+        console.print("[green]✓ Issues already exist in repository — skipping[/green]")
+        return
+
     console.print("[yellow]⠸ Creating issues...[/yellow]")
 
     todo_option_id = option_ids.get("To Do")
