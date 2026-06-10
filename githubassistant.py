@@ -617,58 +617,13 @@ def push_branches(repo_path: Path, repo_name: str) -> None:
 # GitHub Project board (v2)
 # ---------------------------------------------------------------------------
 
-def create_project_board(repo_name: str) -> Tuple[str, str, str, Dict[str, str]]:
+def set_board_columns(status_field_id: str) -> Dict[str, str]:
     """
-    Create a GitHub Projects v2 board.
-    Returns (project_number, project_node_id, status_field_id, option_ids).
-    option_ids maps column name -> option node ID.
+    Replace Status field options with our four columns via GraphQL.
+    Returns option_ids mapping column name -> option node ID.
+    Always called regardless of whether the board was just created or already existed,
+    so a previously failed column update is safely retried.
     """
-    # Skip if board already exists
-    existing = get_existing_project(repo_name)
-    if existing:
-        project_number = str(existing["number"])
-        project_id = existing["id"]
-        console.print(f"[green]✓ Project board already exists: {repo_name} — skipping creation[/green]")
-        status_field_id, option_ids = get_existing_project_fields(project_number)
-        if not status_field_id:
-            console.print("[red]✗ Status field not found in existing project[/red]")
-            sys.exit(1)
-        return project_number, project_id, status_field_id, option_ids
-
-    console.print("[yellow]⠸ Creating GitHub Project board...[/yellow]")
-
-    result = gh(
-        "project", "create",
-        "--owner", GITHUB_USERNAME,
-        "--title", repo_name,
-        "--format", "json",
-    )
-    project_data = json.loads(result.stdout)
-    project_number = str(project_data["number"])
-    project_id = project_data["id"]  # node ID
-
-    console.print(f"[green]✓ Project board created: {repo_name}[/green]")
-
-    # Fetch the Status field node ID
-    fields_result = gh(
-        "project", "field-list", project_number,
-        "--owner", GITHUB_USERNAME,
-        "--format", "json",
-    )
-    fields_data = json.loads(fields_result.stdout)
-
-    status_field_id = None
-    for field in fields_data.get("fields", []):
-        if field.get("name") == "Status":
-            status_field_id = field["id"]
-            break
-
-    if not status_field_id:
-        console.print("[red]✗ Status field not found in project[/red]")
-        sys.exit(1)
-
-    # Replace default options with our four columns using GraphQL
-    # updateProjectV2Field with singleSelectOptions replaces all options
     mutation = f"""
     mutation {{
       updateProjectV2Field(input: {{
@@ -702,7 +657,58 @@ def create_project_board(repo_name: str) -> Tuple[str, str, str, Dict[str, str]]
         for opt in updated_field.get("options", [])
     }
 
-    console.print("[green]✓ Columns created: To Do, In Progress, Blocked, Done[/green]")
+    if "To Do" not in option_ids:
+        console.print("[red]✗ Column update succeeded but 'To Do' option not found in response[/red]")
+        sys.exit(1)
+
+    console.print("[green]✓ Columns set: To Do, In Progress, Blocked, Done[/green]")
+    return option_ids
+
+
+def create_project_board(repo_name: str) -> Tuple[str, str, str, Dict[str, str]]:
+    """
+    Create (or reuse) a GitHub Projects v2 board.
+    Returns (project_number, project_node_id, status_field_id, option_ids).
+    option_ids maps column name -> option node ID.
+    Always ensures columns are correctly set even if a previous run failed mid-way.
+    """
+    existing = get_existing_project(repo_name)
+    if existing:
+        project_number = str(existing["number"])
+        project_id = existing["id"]
+        console.print(f"[green]✓ Project board already exists: {repo_name}[/green]")
+    else:
+        console.print("[yellow]⠸ Creating GitHub Project board...[/yellow]")
+        result = gh(
+            "project", "create",
+            "--owner", GITHUB_USERNAME,
+            "--title", repo_name,
+            "--format", "json",
+        )
+        project_data = json.loads(result.stdout)
+        project_number = str(project_data["number"])
+        project_id = project_data["id"]
+        console.print(f"[green]✓ Project board created: {repo_name}[/green]")
+
+    # Always fetch the Status field and set columns — handles partial failures on re-run
+    fields_result = gh(
+        "project", "field-list", project_number,
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+    )
+    fields_data = json.loads(fields_result.stdout)
+
+    status_field_id = None
+    for field in fields_data.get("fields", []):
+        if field.get("name") == "Status":
+            status_field_id = field["id"]
+            break
+
+    if not status_field_id:
+        console.print("[red]✗ Status field not found in project[/red]")
+        sys.exit(1)
+
+    option_ids = set_board_columns(status_field_id)
     return project_number, project_id, status_field_id, option_ids
 
 
