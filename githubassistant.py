@@ -24,7 +24,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
-DEFAULT_VISIBILITY = os.getenv("DEFAULT_VISIBILITY", "private")
+DEFAULT_VISIBILITY = os.getenv("DEFAULT_VISIBILITY", "public")
 
 console = Console()
 
