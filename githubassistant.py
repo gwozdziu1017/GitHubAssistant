@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import anthropic
 from dotenv import load_dotenv
@@ -80,7 +81,7 @@ No vague language. Every step must be implementable without further clarificatio
 
 # Patterns that suggest an API key or secret was left in the spec file.
 # Each tuple is (label, regex).
-_SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
+_SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("Anthropic API key",       re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}")),
     ("OpenAI API key",          re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
     ("GitHub token",            re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}")),
@@ -120,7 +121,7 @@ def save_cache(cache: dict) -> None:
         console.print(f"[yellow]⚠  Could not save cache: {e}[/yellow]")
 
 
-def get_cached_stories(spec_content: str) -> dict | None:
+def get_cached_stories(spec_content: str) -> Optional[dict]:
     """Return cached Claude response for this spec, or None if not cached."""
     cache = load_cache()
     return cache.get(_spec_hash(spec_content))
@@ -135,7 +136,7 @@ def set_cached_stories(spec_content: str, data: dict) -> None:
 
 def scan_for_secrets(content: str, source_label: str) -> None:
     """Warn and abort if content appears to contain API keys or secrets."""
-    hits: list[str] = []
+    hits: List[str] = []
     for label, pattern in _SECRET_PATTERNS:
         if pattern.search(content):
             hits.append(label)
@@ -162,7 +163,7 @@ def scan_for_secrets(content: str, source_label: str) -> None:
     sys.exit(1)
 
 
-def confirm_step(title: str, details: list[str]) -> None:
+def confirm_step(title: str, details: List[str]) -> None:
     """
     Display what is about to happen and require explicit user confirmation.
     If the user declines, offer to retry (re-read the step) or abort entirely.
@@ -581,7 +582,7 @@ def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
         .get("updateProjectV2Field", {})
         .get("projectV2Field", {})
     )
-    option_ids: dict[str, str] = {
+    option_ids: Dict[str, str] = {
         opt["name"]: opt["id"]
         for opt in updated_field.get("options", [])
     }
@@ -594,7 +595,7 @@ def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
 # Epic labels
 # ---------------------------------------------------------------------------
 
-def create_labels(repo_name: str, epics: list[str]) -> None:
+def create_labels(repo_name: str, epics: List[str]) -> None:
     console.print("[yellow]⠸ Creating epic labels...[/yellow]")
     colors = [
         "0075ca", "e4e669", "d73a4a", "0e8a16",
@@ -636,7 +637,7 @@ def format_issue_body(story: dict) -> str:
 
 def create_issues(
     repo_name: str,
-    stories: list[dict],
+    stories: List[dict],
     project_number: str,
     project_id: str,
     status_field_id: str,
