@@ -575,7 +575,6 @@ def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
     mutation = f"""
     mutation {{
       updateProjectV2Field(input: {{
-        projectId: "{project_id}"
         fieldId: "{status_field_id}"
         singleSelectOptions: [
           {{name: "To Do",       color: GRAY,   description: ""}}
