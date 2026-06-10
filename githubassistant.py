@@ -2,12 +2,14 @@
 """GitHubAssistant — Bootstrap a GitHub project from a *_SPEC.md file."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import anthropic
 from dotenv import load_dotenv
@@ -22,7 +24,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
-DEFAULT_VISIBILITY = os.getenv("DEFAULT_VISIBILITY", "private")
+DEFAULT_VISIBILITY = os.getenv("DEFAULT_VISIBILITY", "public")
 
 console = Console()
 
@@ -79,7 +81,7 @@ No vague language. Every step must be implementable without further clarificatio
 
 # Patterns that suggest an API key or secret was left in the spec file.
 # Each tuple is (label, regex).
-_SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
+_SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("Anthropic API key",       re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}")),
     ("OpenAI API key",          re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
     ("GitHub token",            re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}")),
@@ -89,9 +91,52 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Cache — stores Claude API responses keyed by spec content hash
+# ---------------------------------------------------------------------------
+
+CACHE_PATH = Path.home() / ".githubassistant_cache.json"
+
+
+def _spec_hash(spec_content: str) -> str:
+    """Return a SHA-256 hash of the spec content used as cache key."""
+    return hashlib.sha256(spec_content.encode("utf-8")).hexdigest()
+
+
+def load_cache() -> dict:
+    """Load the cache file, returning an empty dict if it doesn't exist."""
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    """Persist the cache dict to disk."""
+    try:
+        CACHE_PATH.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except OSError as e:
+        console.print(f"[yellow]⚠  Could not save cache: {e}[/yellow]")
+
+
+def get_cached_stories(spec_content: str) -> Optional[dict]:
+    """Return cached Claude response for this spec, or None if not cached."""
+    cache = load_cache()
+    return cache.get(_spec_hash(spec_content))
+
+
+def set_cached_stories(spec_content: str, data: dict) -> None:
+    """Store Claude response in cache keyed by spec hash."""
+    cache = load_cache()
+    cache[_spec_hash(spec_content)] = data
+    save_cache(cache)
+
+
 def scan_for_secrets(content: str, source_label: str) -> None:
     """Warn and abort if content appears to contain API keys or secrets."""
-    hits: list[str] = []
+    hits: List[str] = []
     for label, pattern in _SECRET_PATTERNS:
         if pattern.search(content):
             hits.append(label)
@@ -118,24 +163,70 @@ def scan_for_secrets(content: str, source_label: str) -> None:
     sys.exit(1)
 
 
-def confirm_step(title: str, details: list[str]) -> None:
-    """Display what is about to happen and require explicit user confirmation."""
-    console.print()
-    body = "\n".join(f"  {d}" for d in details)
-    console.print(
-        Panel(body, title=f"[bold cyan]Next step: {title}[/bold cyan]", border_style="cyan")
-    )
-    if not Confirm.ask("  Proceed with this step?"):
-        console.print("[yellow]Aborted by user.[/yellow]")
-        sys.exit(0)
+def confirm_step(
+    title: str,
+    details: Union[List[str], Callable[[], List[str]]],
+    on_decline: Optional[Callable] = None,
+) -> None:
+    """
+    Show a step panel and ask the user to confirm before proceeding.
+
+    details     — static list of strings, or a callable that returns one so the
+                  panel refreshes after reconfiguration.
+    on_decline  — optional callable invoked when the user presses n and chooses
+                  to reconfigure. It should re-prompt whatever inputs are relevant
+                  to this step and update state via nonlocal/closure. After it
+                  returns, the panel is re-shown with fresh details.
+                  If None, pressing n only offers Abort (nothing to reconfigure).
+    """
+    while True:
+        console.print()
+        current_details = details() if callable(details) else details
+        body = "\n".join(f"  {d}" for d in current_details)
+        console.print(
+            Panel(body, title=f"[bold cyan]Next step: {title}[/bold cyan]", border_style="cyan")
+        )
+
+        if Confirm.ask("  Proceed with this step?"):
+            return
+
+        # User pressed n
+        console.print()
+        if on_decline:
+            console.print("  [yellow]What would you like to do?[/yellow]")
+            console.print("    [bold]r[/bold] — Reconfigure and review again")
+            console.print("    [bold]a[/bold] — Abort the entire script")
+            console.print()
+            choice = Prompt.ask("  Your choice", choices=["r", "a"], default="r")
+            if choice == "a":
+                console.print("[yellow]Aborted by user.[/yellow]")
+                sys.exit(0)
+            on_decline()   # re-prompt inputs, update state; then loop to re-show panel
+        else:
+            # Nothing to reconfigure — confirm abort or loop back
+            console.print("  [yellow]Nothing to reconfigure for this step.[/yellow]")
+            console.print("    [bold]y[/bold] — Abort the entire script")
+            console.print("    [bold]n[/bold] — Go back and review again")
+            console.print()
+            if Confirm.ask("  Abort the script?", default=False):
+                console.print("[yellow]Aborted by user.[/yellow]")
+                sys.exit(0)
+            # n → loop back and re-show the panel
 
 
 def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run a gh CLI command and return the result."""
     result = subprocess.run(["gh", *args], capture_output=True, text=True)
     if check and result.returncode != 0:
-        console.print(f"[red]✗ gh {' '.join(args)} failed[/red]")
-        console.print(f"[red]{result.stderr.strip()}[/red]")
+        stderr = result.stderr.strip() or result.stdout.strip() or "No error details available."
+        console.print(
+            Panel(
+                f"[red]Command:[/red] gh {' '.join(args)}\n\n"
+                f"[red]Error:[/red] {stderr}",
+                title="[bold red]✗ GitHub CLI error[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
     return result
 
@@ -156,16 +247,42 @@ def gh_graphql(query: str) -> dict:
 
 def check_prerequisites() -> None:
     if not ANTHROPIC_API_KEY:
-        console.print("[red]✗ ANTHROPIC_API_KEY not set in .env[/red]")
+        console.print(
+            Panel(
+                "ANTHROPIC_API_KEY is not set.\n\n"
+                "Add it to your shell profile (~/.zshrc or ~/.bashrc):\n"
+                "  export ANTHROPIC_API_KEY=sk-ant-...\n\n"
+                "Then reload your shell:  source ~/.zshrc",
+                title="[bold red]✗ Missing ANTHROPIC_API_KEY[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     if not GITHUB_USERNAME:
-        console.print("[red]✗ GITHUB_USERNAME not set in .env[/red]")
+        console.print(
+            Panel(
+                "GITHUB_USERNAME is not set.\n\n"
+                "Add it to your shell profile (~/.zshrc or ~/.bashrc):\n"
+                "  export GITHUB_USERNAME=your-username\n\n"
+                "Then reload your shell:  source ~/.zshrc",
+                title="[bold red]✗ Missing GITHUB_USERNAME[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if result.returncode != 0:
-        console.print("[red]✗ gh CLI not authenticated — run: gh auth login[/red]")
+        console.print(
+            Panel(
+                "gh CLI is not authenticated.\n\n"
+                "Run:  gh auth login\n\n"
+                f"Details: {result.stderr.strip()}",
+                title="[bold red]✗ GitHub CLI not authenticated[/bold red]",
+                border_style="red",
+            )
+        )
         sys.exit(1)
 
     console.print("[green]✓ Prerequisites OK[/green]")
@@ -198,13 +315,23 @@ def read_spec(spec_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_stories(spec_content: str) -> dict:
+    # Check cache before making an API call
+    cached = get_cached_stories(spec_content)
+    if cached:
+        console.print("[green]✓ Using cached epics and stories (spec unchanged)[/green]")
+        console.print(f"  Epics: {', '.join(cached.get('epics', []))}")
+        console.print(f"  Stories: {len(cached.get('stories', []))} total")
+        if Confirm.ask("  Use cached result? (n = regenerate via API)"):
+            return cached
+        console.print("[yellow]⠸ Regenerating via API...[/yellow]")
+
     console.print("[yellow]⠸ Analysing spec with Claude Opus...[/yellow]")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     message = client.messages.create(
         model="claude-opus-4-8",
-        max_tokens=8096,
+        max_tokens=16000,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -229,16 +356,38 @@ def generate_stories(spec_content: str) -> dict:
         # Fallback: extract the first {...} block
         match = re.search(r"\{.*\}", response_text, re.DOTALL)
         if not match:
-            console.print("[red]✗ Could not parse Claude response as JSON[/red]")
-            console.print(response_text)
+            console.print(
+                Panel(
+                    "Claude did not return valid JSON.\n\n"
+                    "This is unexpected — please try running the script again.",
+                    title="[bold red]✗ Failed to parse Claude response[/bold red]",
+                    border_style="red",
+                )
+            )
             sys.exit(1)
-        data = json.loads(match.group())
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            console.print(
+                Panel(
+                    "Claude's response was cut off before it could finish.\n\n"
+                    "The spec may be too large for a single API call.\n"
+                    "Try splitting the spec into smaller sections and running separately.",
+                    title="[bold red]✗ Claude response truncated[/bold red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
 
     epics = data.get("epics", [])
     stories = data.get("stories", [])
 
     console.print(f"[green]✓ Epics generated: {', '.join(epics)}[/green]")
     console.print(f"[green]✓ User stories generated: {len(stories)} total[/green]")
+
+    set_cached_stories(spec_content, data)
+    console.print(f"[green]✓ Response cached to {CACHE_PATH}[/green]")
+
     return data
 
 
@@ -275,19 +424,94 @@ def display_plan(spec_path: Path, repo_name: str, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# State checks — detect what is already done so steps can be skipped
+# ---------------------------------------------------------------------------
+
+def local_repo_exists(repo_name: str, target_dir: Path) -> bool:
+    """Return True if a git repo already exists at target_dir/repo_name."""
+    repo_path = target_dir / repo_name
+    return repo_path.exists() and (repo_path / ".git").exists()
+
+
+def remote_repo_exists(repo_name: str) -> bool:
+    """Return True if the remote GitHub repo already exists."""
+    result = gh("repo", "view", f"{GITHUB_USERNAME}/{repo_name}", check=False)
+    return result.returncode == 0
+
+
+def remote_has_branches(repo_name: str) -> bool:
+    """Return True if master and dev branches are already pushed to remote."""
+    result = gh(
+        "api", f"repos/{GITHUB_USERNAME}/{repo_name}/branches", check=False
+    )
+    if result.returncode != 0:
+        return False
+    branches = {b["name"] for b in json.loads(result.stdout)}
+    return "master" in branches and "dev" in branches
+
+
+def get_existing_project(repo_name: str) -> Optional[dict]:
+    """Return project data dict if a project board named repo_name already exists, else None."""
+    result = gh(
+        "project", "list",
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for project in json.loads(result.stdout).get("projects", []):
+        if project.get("title") == repo_name:
+            return project
+    return None
+
+
+def get_existing_project_fields(project_number: str) -> Tuple[Optional[str], Dict[str, str]]:
+    """
+    Return (status_field_id, option_ids) for an existing project board.
+    option_ids maps column name -> option node ID.
+    """
+    fields_result = gh(
+        "project", "field-list", project_number,
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+    )
+    fields_data = json.loads(fields_result.stdout)
+    for field in fields_data.get("fields", []):
+        if field.get("name") == "Status":
+            option_ids = {opt["name"]: opt["id"] for opt in field.get("options", [])}
+            return field["id"], option_ids
+    return None, {}
+
+
+def repo_has_issues(repo_name: str) -> bool:
+    """Return True if the repo already has at least one issue."""
+    result = gh(
+        "issue", "list",
+        "--repo", f"{GITHUB_USERNAME}/{repo_name}",
+        "--state", "all",
+        "--limit", "1",
+        "--json", "number",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return len(json.loads(result.stdout)) > 0
+
+
+# ---------------------------------------------------------------------------
 # Local repository
 # ---------------------------------------------------------------------------
 
-def create_local_repo(repo_name: str) -> Path:
-    repo_path = Path.cwd() / repo_name
+def create_local_repo(repo_name: str, target_dir: Path) -> Path:
+    repo_path = target_dir / repo_name
 
-    if repo_path.exists():
-        console.print(f"[yellow]⚠  Directory {repo_name}/ already exists[/yellow]")
-        if not Confirm.ask("Continue anyway?"):
-            sys.exit(0)
-    else:
-        repo_path.mkdir(parents=True)
+    # Skip if already initialised
+    if local_repo_exists(repo_name, target_dir):
+        console.print(f"[green]✓ Local repository already exists: {repo_path} — skipping[/green]")
+        return repo_path
 
+    repo_path.mkdir(parents=True, exist_ok=True)
     console.print("[yellow]⠸ Initialising local repository...[/yellow]")
 
     repo = Repo.init(repo_path)
@@ -319,16 +543,19 @@ def create_local_repo(repo_name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def create_remote_repo(repo_name: str) -> str:
-    console.print("[yellow]⠸ Creating remote GitHub repository...[/yellow]")
+    repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
 
+    if remote_repo_exists(repo_name):
+        console.print(f"[green]✓ Remote repository already exists: {repo_url} — skipping[/green]")
+        return repo_url
+
+    console.print("[yellow]⠸ Creating remote GitHub repository...[/yellow]")
     gh(
         "repo", "create",
         f"{GITHUB_USERNAME}/{repo_name}",
         f"--{DEFAULT_VISIBILITY}",
         "--description", f"{repo_name} — created by GitHubAssistant",
     )
-
-    repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
     console.print(f"[green]✓ Remote repository created: {repo_url} ({DEFAULT_VISIBILITY})[/green]")
     return repo_url
 
@@ -365,11 +592,18 @@ def verify_gitignore_covers_env(repo_path: Path) -> None:
 
 
 def push_branches(repo_path: Path, repo_name: str) -> None:
+    if remote_has_branches(repo_name):
+        console.print("[green]✓ Branches already pushed to remote — skipping[/green]")
+        return
+
     verify_gitignore_covers_env(repo_path)
 
     repo = Repo(repo_path)
     remote_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}.git"
-    repo.create_remote("origin", remote_url)
+
+    # Add remote only if not already set
+    if "origin" not in [r.name for r in repo.remotes]:
+        repo.create_remote("origin", remote_url)
     console.print("[green]✓ Local connected to remote[/green]")
 
     console.print("[yellow]⠸ Pushing branches...[/yellow]")
@@ -383,50 +617,16 @@ def push_branches(repo_path: Path, repo_name: str) -> None:
 # GitHub Project board (v2)
 # ---------------------------------------------------------------------------
 
-def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
+def set_board_columns(status_field_id: str) -> Dict[str, str]:
     """
-    Create a GitHub Projects v2 board.
-    Returns (project_number, project_node_id, status_field_id, option_ids).
-    option_ids maps column name -> option node ID.
+    Replace Status field options with our four columns via GraphQL.
+    Returns option_ids mapping column name -> option node ID.
+    Always called regardless of whether the board was just created or already existed,
+    so a previously failed column update is safely retried.
     """
-    console.print("[yellow]⠸ Creating GitHub Project board...[/yellow]")
-
-    result = gh(
-        "project", "create",
-        "--owner", GITHUB_USERNAME,
-        "--title", repo_name,
-        "--format", "json",
-    )
-    project_data = json.loads(result.stdout)
-    project_number = str(project_data["number"])
-    project_id = project_data["id"]  # node ID
-
-    console.print(f"[green]✓ Project board created: {repo_name}[/green]")
-
-    # Fetch the Status field node ID
-    fields_result = gh(
-        "project", "field-list", project_number,
-        "--owner", GITHUB_USERNAME,
-        "--format", "json",
-    )
-    fields_data = json.loads(fields_result.stdout)
-
-    status_field_id = None
-    for field in fields_data.get("fields", []):
-        if field.get("name") == "Status":
-            status_field_id = field["id"]
-            break
-
-    if not status_field_id:
-        console.print("[red]✗ Status field not found in project[/red]")
-        sys.exit(1)
-
-    # Replace default options with our four columns using GraphQL
-    # updateProjectV2Field with singleSelectOptions replaces all options
     mutation = f"""
     mutation {{
       updateProjectV2Field(input: {{
-        projectId: "{project_id}"
         fieldId: "{status_field_id}"
         singleSelectOptions: [
           {{name: "To Do",       color: GRAY,   description: ""}}
@@ -452,12 +652,63 @@ def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
         .get("updateProjectV2Field", {})
         .get("projectV2Field", {})
     )
-    option_ids: dict[str, str] = {
+    option_ids: Dict[str, str] = {
         opt["name"]: opt["id"]
         for opt in updated_field.get("options", [])
     }
 
-    console.print("[green]✓ Columns created: To Do, In Progress, Blocked, Done[/green]")
+    if "To Do" not in option_ids:
+        console.print("[red]✗ Column update succeeded but 'To Do' option not found in response[/red]")
+        sys.exit(1)
+
+    console.print("[green]✓ Columns set: To Do, In Progress, Blocked, Done[/green]")
+    return option_ids
+
+
+def create_project_board(repo_name: str) -> Tuple[str, str, str, Dict[str, str]]:
+    """
+    Create (or reuse) a GitHub Projects v2 board.
+    Returns (project_number, project_node_id, status_field_id, option_ids).
+    option_ids maps column name -> option node ID.
+    Always ensures columns are correctly set even if a previous run failed mid-way.
+    """
+    existing = get_existing_project(repo_name)
+    if existing:
+        project_number = str(existing["number"])
+        project_id = existing["id"]
+        console.print(f"[green]✓ Project board already exists: {repo_name}[/green]")
+    else:
+        console.print("[yellow]⠸ Creating GitHub Project board...[/yellow]")
+        result = gh(
+            "project", "create",
+            "--owner", GITHUB_USERNAME,
+            "--title", repo_name,
+            "--format", "json",
+        )
+        project_data = json.loads(result.stdout)
+        project_number = str(project_data["number"])
+        project_id = project_data["id"]
+        console.print(f"[green]✓ Project board created: {repo_name}[/green]")
+
+    # Always fetch the Status field and set columns — handles partial failures on re-run
+    fields_result = gh(
+        "project", "field-list", project_number,
+        "--owner", GITHUB_USERNAME,
+        "--format", "json",
+    )
+    fields_data = json.loads(fields_result.stdout)
+
+    status_field_id = None
+    for field in fields_data.get("fields", []):
+        if field.get("name") == "Status":
+            status_field_id = field["id"]
+            break
+
+    if not status_field_id:
+        console.print("[red]✗ Status field not found in project[/red]")
+        sys.exit(1)
+
+    option_ids = set_board_columns(status_field_id)
     return project_number, project_id, status_field_id, option_ids
 
 
@@ -465,7 +716,7 @@ def create_project_board(repo_name: str) -> tuple[str, str, str, dict]:
 # Epic labels
 # ---------------------------------------------------------------------------
 
-def create_labels(repo_name: str, epics: list[str]) -> None:
+def create_labels(repo_name: str, epics: List[str]) -> None:
     console.print("[yellow]⠸ Creating epic labels...[/yellow]")
     colors = [
         "0075ca", "e4e669", "d73a4a", "0e8a16",
@@ -507,12 +758,16 @@ def format_issue_body(story: dict) -> str:
 
 def create_issues(
     repo_name: str,
-    stories: list[dict],
+    stories: List[dict],
     project_number: str,
     project_id: str,
     status_field_id: str,
     option_ids: dict,
 ) -> None:
+    if repo_has_issues(repo_name):
+        console.print("[green]✓ Issues already exist in repository — skipping[/green]")
+        return
+
     console.print("[yellow]⠸ Creating issues...[/yellow]")
 
     todo_option_id = option_ids.get("To Do")
@@ -605,21 +860,62 @@ def main() -> None:
     )
     data = generate_stories(spec_content)
 
-    # ── Collect repo name, display plan, final confirmation ─────────────────
-    console.print()
-    repo_name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
-    if not repo_name:
-        console.print("[red]✗ Repository name cannot be empty[/red]")
-        sys.exit(1)
+    # ── Collect repo name and target directory ───────────────────────────────
+    # Stored as a mutable container so the nested on_decline closure can update them.
+    state: Dict[str, object] = {
+        "repo_name": "",
+        "target_dir": Path.home() / "Coding",
+    }
 
-    if not re.match(r"^[a-zA-Z0-9._-]+$", repo_name):
-        console.print(
-            "[red]✗ Invalid repository name. "
-            "Use letters, numbers, hyphens, underscores, or dots only.[/red]"
-        )
-        sys.exit(1)
+    def prompt_repo_details() -> None:
+        """Re-prompt repo name and target directory, updating shared state."""
+        default_dir = state["target_dir"]
+        while True:
+            console.print()
+            name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
+            if not name:
+                console.print("[red]✗ Repository name cannot be empty — try again[/red]")
+                continue
+            if not re.match(r"^[a-zA-Z0-9._-]+$", name):
+                console.print(
+                    "[red]✗ Invalid name — letters, numbers, hyphens, underscores, dots only[/red]"
+                )
+                continue
 
-    display_plan(spec_path, repo_name, data)
+            raw_dir = Prompt.ask(
+                "[bold]Where should the local repo be created?[/bold]",
+                default=str(default_dir),
+            ).strip()
+            resolved = Path(raw_dir).expanduser().resolve()
+            state["repo_name"] = name
+            state["target_dir"] = resolved
+            break
+
+    # Run once immediately to populate state before the first confirm_step
+    prompt_repo_details()
+
+    def repo_step_details() -> List[str]:
+        """Return current step-3 details — re-evaluated after every reconfigure."""
+        tdir = state["target_dir"]
+        rname = state["repo_name"]
+        lines = [
+            f"Create directory: {tdir / rname}",
+            "Initialise git with master as default branch",
+            "Create README.md and .gitignore (includes .env rule)",
+            "Make initial commit on master",
+            "Create dev branch",
+        ]
+        if not tdir.exists():
+            lines.append(f"⚠  {tdir} does not exist — it will be created")
+        return lines
+
+    def remote_step_details() -> List[str]:
+        return [
+            f"Create: github.com/{GITHUB_USERNAME}/{state['repo_name']} ({DEFAULT_VISIBILITY})",
+            "This action is visible on your GitHub account",
+        ]
+
+    display_plan(spec_path, str(state["repo_name"]) or "—", data)
 
     if not Confirm.ask("[bold]Proceed with full execution?[/bold]"):
         console.print("[yellow]Aborted.[/yellow]")
@@ -629,57 +925,56 @@ def main() -> None:
     console.rule("[bold blue]Executing[/bold blue]")
     console.print()
 
+    # Convenience accessors — read from state after all confirmations are done
+    def repo_name() -> str:
+        return str(state["repo_name"])
+
+    def target_dir() -> Path:
+        return Path(str(state["target_dir"]))
+
     # ── Step 3: local repository ─────────────────────────────────────────────
     confirm_step(
         "Create local repository",
-        [
-            f"Create directory: ./{repo_name}/",
-            "Initialise git with master as default branch",
-            "Create README.md and .gitignore (includes .env rule)",
-            "Make initial commit on master",
-            "Create dev branch",
-        ],
+        details=repo_step_details,
+        on_decline=prompt_repo_details,
     )
-    repo_path = create_local_repo(repo_name)
+    repo_path = create_local_repo(repo_name(), target_dir())
 
     # ── Step 4: remote repository ────────────────────────────────────────────
     confirm_step(
         "Create remote GitHub repository",
-        [
-            f"Create: github.com/{GITHUB_USERNAME}/{repo_name} ({DEFAULT_VISIBILITY})",
-            "This action is visible on your GitHub account",
-        ],
+        details=remote_step_details,
     )
-    create_remote_repo(repo_name)
+    create_remote_repo(repo_name())
 
     # ── Step 5: push branches ────────────────────────────────────────────────
     confirm_step(
         "Push branches to remote",
-        [
+        details=[
             "Verify .gitignore covers .env before pushing",
             "Connect local repo to origin",
             "Push master branch",
             "Push dev branch",
         ],
     )
-    push_branches(repo_path, repo_name)
+    push_branches(repo_path, repo_name())
 
     # ── Step 6: project board ────────────────────────────────────────────────
     confirm_step(
         "Create GitHub Project board",
-        [
-            f"Create Projects v2 board titled: {repo_name}",
+        details=lambda: [
+            f"Create Projects v2 board titled: {repo_name()}",
             "Set Status columns: To Do, In Progress, Blocked, Done (via GraphQL)",
         ],
     )
-    project_number, project_id, status_field_id, option_ids = create_project_board(repo_name)
+    project_number, project_id, status_field_id, option_ids = create_project_board(repo_name())
 
     # ── Step 7: labels ───────────────────────────────────────────────────────
     confirm_step(
         "Create epic labels",
-        [f"Create label: {epic}" for epic in data["epics"]],
+        details=[f"Create label: {epic}" for epic in data["epics"]],
     )
-    create_labels(repo_name, data["epics"])
+    create_labels(repo_name(), data["epics"])
 
     # ── Step 8: issues ───────────────────────────────────────────────────────
     confirm_step(
@@ -692,7 +987,7 @@ def main() -> None:
         ],
     )
     create_issues(
-        repo_name,
+        repo_name(),
         data["stories"],
         project_number,
         project_id,
@@ -703,14 +998,28 @@ def main() -> None:
     console.print()
     console.rule("[bold green]All done[/bold green]")
     console.print()
-    console.print(f"  [bold]{repo_name}[/bold] is ready.")
+    console.print(f"  [bold]{repo_name()}[/bold] is ready.")
     console.print(f"  {len(data['stories'])} issues waiting on the board.")
-    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{repo_name}")
+    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{repo_name()}")
     console.print(f"  Board: https://github.com/users/{GITHUB_USERNAME}/projects")
     console.print()
-    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{repo_name} --label {data['epics'][0]}")
+    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{repo_name()} --label {data['epics'][0]}")
     console.print()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user. Exiting.[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(
+            Panel(
+                f"{type(e).__name__}: {e}\n\n"
+                "If this keeps happening, check your .env / shell config and gh auth status.",
+                title="[bold red]✗ Unexpected error[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
