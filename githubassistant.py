@@ -735,29 +735,44 @@ def main() -> None:
     )
     data = generate_stories(spec_content)
 
-    # ── Collect repo name and target directory ───────────────────────────────
-    console.print()
-    repo_name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
-    if not repo_name:
-        console.print("[red]✗ Repository name cannot be empty[/red]")
-        sys.exit(1)
-
-    if not re.match(r"^[a-zA-Z0-9._-]+$", repo_name):
-        console.print(
-            "[red]✗ Invalid repository name. "
-            "Use letters, numbers, hyphens, underscores, or dots only.[/red]"
-        )
-        sys.exit(1)
-
+    # ── Collect repo name and target directory (loop until confirmed) ────────
     default_dir = Path.home() / "Coding"
-    raw_dir = Prompt.ask(
-        "[bold]Where should the local repo be created?[/bold]",
-        default=str(default_dir),
-    ).strip()
-    target_dir = Path(raw_dir).expanduser().resolve()
+    while True:
+        console.print()
+        repo_name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
+        if not repo_name:
+            console.print("[red]✗ Repository name cannot be empty — try again[/red]")
+            continue
 
-    if not target_dir.exists():
-        console.print(f"[yellow]⚠  Directory {target_dir} does not exist — it will be created[/yellow]")
+        if not re.match(r"^[a-zA-Z0-9._-]+$", repo_name):
+            console.print(
+                "[red]✗ Invalid name — use letters, numbers, hyphens, underscores, or dots only[/red]"
+            )
+            continue
+
+        raw_dir = Prompt.ask(
+            "[bold]Where should the local repo be created?[/bold]",
+            default=str(default_dir),
+        ).strip()
+        target_dir = Path(raw_dir).expanduser().resolve()
+
+        # Show a summary and ask for confirmation before moving on
+        console.print()
+        console.print(
+            Panel(
+                f"  Repository name:  [bold]{repo_name}[/bold]\n"
+                f"  Local path:       [bold]{target_dir / repo_name}[/bold]\n"
+                f"  Remote:           [bold]github.com/{GITHUB_USERNAME}/{repo_name}[/bold]\n"
+                f"  Visibility:       [bold]{DEFAULT_VISIBILITY}[/bold]"
+                + (f"\n\n  [yellow]⚠  {target_dir} does not exist — it will be created[/yellow]"
+                   if not target_dir.exists() else ""),
+                title="[bold cyan]Confirm repository details[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        if Confirm.ask("  Look correct?"):
+            break
+        console.print("[yellow]  Let's try again...[/yellow]")
 
     display_plan(spec_path, repo_name, data)
 
