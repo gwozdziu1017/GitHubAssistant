@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import anthropic
 from dotenv import load_dotenv
@@ -163,36 +163,55 @@ def scan_for_secrets(content: str, source_label: str) -> None:
     sys.exit(1)
 
 
-def confirm_step(title: str, details: List[str]) -> None:
+def confirm_step(
+    title: str,
+    details: Union[List[str], Callable[[], List[str]]],
+    on_decline: Optional[Callable] = None,
+) -> None:
     """
-    Display what is about to happen and require explicit user confirmation.
-    If the user declines, offer to retry (re-read the step) or abort entirely.
-    Loops until the user either confirms or explicitly chooses to abort.
+    Show a step panel and ask the user to confirm before proceeding.
+
+    details     — static list of strings, or a callable that returns one so the
+                  panel refreshes after reconfiguration.
+    on_decline  — optional callable invoked when the user presses n and chooses
+                  to reconfigure. It should re-prompt whatever inputs are relevant
+                  to this step and update state via nonlocal/closure. After it
+                  returns, the panel is re-shown with fresh details.
+                  If None, pressing n only offers Abort (nothing to reconfigure).
     """
     while True:
         console.print()
-        body = "\n".join(f"  {d}" for d in details)
+        current_details = details() if callable(details) else details
+        body = "\n".join(f"  {d}" for d in current_details)
         console.print(
             Panel(body, title=f"[bold cyan]Next step: {title}[/bold cyan]", border_style="cyan")
         )
 
         if Confirm.ask("  Proceed with this step?"):
-            return  # User confirmed — carry on
+            return
 
-        # User pressed n — offer options instead of exiting immediately
+        # User pressed n
         console.print()
-        console.print("  [yellow]What would you like to do?[/yellow]")
-        console.print("    [bold]r[/bold] — Review this step again")
-        console.print("    [bold]a[/bold] — Abort the entire script")
-        console.print()
-
-        while True:
+        if on_decline:
+            console.print("  [yellow]What would you like to do?[/yellow]")
+            console.print("    [bold]r[/bold] — Reconfigure and review again")
+            console.print("    [bold]a[/bold] — Abort the entire script")
+            console.print()
             choice = Prompt.ask("  Your choice", choices=["r", "a"], default="r")
-            if choice == "r":
-                break   # Loop back and show the step panel again
             if choice == "a":
                 console.print("[yellow]Aborted by user.[/yellow]")
                 sys.exit(0)
+            on_decline()   # re-prompt inputs, update state; then loop to re-show panel
+        else:
+            # Nothing to reconfigure — confirm abort or loop back
+            console.print("  [yellow]Nothing to reconfigure for this step.[/yellow]")
+            console.print("    [bold]y[/bold] — Abort the entire script")
+            console.print("    [bold]n[/bold] — Go back and review again")
+            console.print()
+            if Confirm.ask("  Abort the script?", default=False):
+                console.print("[yellow]Aborted by user.[/yellow]")
+                sys.exit(0)
+            # n → loop back and re-show the panel
 
 
 def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -735,46 +754,62 @@ def main() -> None:
     )
     data = generate_stories(spec_content)
 
-    # ── Collect repo name and target directory (loop until confirmed) ────────
-    default_dir = Path.home() / "Coding"
-    while True:
-        console.print()
-        repo_name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
-        if not repo_name:
-            console.print("[red]✗ Repository name cannot be empty — try again[/red]")
-            continue
+    # ── Collect repo name and target directory ───────────────────────────────
+    # Stored as a mutable container so the nested on_decline closure can update them.
+    state: Dict[str, object] = {
+        "repo_name": "",
+        "target_dir": Path.home() / "Coding",
+    }
 
-        if not re.match(r"^[a-zA-Z0-9._-]+$", repo_name):
-            console.print(
-                "[red]✗ Invalid name — use letters, numbers, hyphens, underscores, or dots only[/red]"
-            )
-            continue
+    def prompt_repo_details() -> None:
+        """Re-prompt repo name and target directory, updating shared state."""
+        default_dir = state["target_dir"]
+        while True:
+            console.print()
+            name = Prompt.ask("[bold]Enter repository name[/bold]").strip()
+            if not name:
+                console.print("[red]✗ Repository name cannot be empty — try again[/red]")
+                continue
+            if not re.match(r"^[a-zA-Z0-9._-]+$", name):
+                console.print(
+                    "[red]✗ Invalid name — letters, numbers, hyphens, underscores, dots only[/red]"
+                )
+                continue
 
-        raw_dir = Prompt.ask(
-            "[bold]Where should the local repo be created?[/bold]",
-            default=str(default_dir),
-        ).strip()
-        target_dir = Path(raw_dir).expanduser().resolve()
-
-        # Show a summary and ask for confirmation before moving on
-        console.print()
-        console.print(
-            Panel(
-                f"  Repository name:  [bold]{repo_name}[/bold]\n"
-                f"  Local path:       [bold]{target_dir / repo_name}[/bold]\n"
-                f"  Remote:           [bold]github.com/{GITHUB_USERNAME}/{repo_name}[/bold]\n"
-                f"  Visibility:       [bold]{DEFAULT_VISIBILITY}[/bold]"
-                + (f"\n\n  [yellow]⚠  {target_dir} does not exist — it will be created[/yellow]"
-                   if not target_dir.exists() else ""),
-                title="[bold cyan]Confirm repository details[/bold cyan]",
-                border_style="cyan",
-            )
-        )
-        if Confirm.ask("  Look correct?"):
+            raw_dir = Prompt.ask(
+                "[bold]Where should the local repo be created?[/bold]",
+                default=str(default_dir),
+            ).strip()
+            resolved = Path(raw_dir).expanduser().resolve()
+            state["repo_name"] = name
+            state["target_dir"] = resolved
             break
-        console.print("[yellow]  Let's try again...[/yellow]")
 
-    display_plan(spec_path, repo_name, data)
+    # Run once immediately to populate state before the first confirm_step
+    prompt_repo_details()
+
+    def repo_step_details() -> List[str]:
+        """Return current step-3 details — re-evaluated after every reconfigure."""
+        tdir = state["target_dir"]
+        rname = state["repo_name"]
+        lines = [
+            f"Create directory: {tdir / rname}",
+            "Initialise git with master as default branch",
+            "Create README.md and .gitignore (includes .env rule)",
+            "Make initial commit on master",
+            "Create dev branch",
+        ]
+        if not tdir.exists():
+            lines.append(f"⚠  {tdir} does not exist — it will be created")
+        return lines
+
+    def remote_step_details() -> List[str]:
+        return [
+            f"Create: github.com/{GITHUB_USERNAME}/{state['repo_name']} ({DEFAULT_VISIBILITY})",
+            "This action is visible on your GitHub account",
+        ]
+
+    display_plan(spec_path, str(state["repo_name"]) or "—", data)
 
     if not Confirm.ask("[bold]Proceed with full execution?[/bold]"):
         console.print("[yellow]Aborted.[/yellow]")
@@ -784,57 +819,56 @@ def main() -> None:
     console.rule("[bold blue]Executing[/bold blue]")
     console.print()
 
+    # Convenience accessors — read from state after all confirmations are done
+    def repo_name() -> str:
+        return str(state["repo_name"])
+
+    def target_dir() -> Path:
+        return Path(str(state["target_dir"]))
+
     # ── Step 3: local repository ─────────────────────────────────────────────
     confirm_step(
         "Create local repository",
-        [
-            f"Create directory: {target_dir / repo_name}",
-            "Initialise git with master as default branch",
-            "Create README.md and .gitignore (includes .env rule)",
-            "Make initial commit on master",
-            "Create dev branch",
-        ],
+        details=repo_step_details,
+        on_decline=prompt_repo_details,
     )
-    repo_path = create_local_repo(repo_name, target_dir)
+    repo_path = create_local_repo(repo_name(), target_dir())
 
     # ── Step 4: remote repository ────────────────────────────────────────────
     confirm_step(
         "Create remote GitHub repository",
-        [
-            f"Create: github.com/{GITHUB_USERNAME}/{repo_name} ({DEFAULT_VISIBILITY})",
-            "This action is visible on your GitHub account",
-        ],
+        details=remote_step_details,
     )
-    create_remote_repo(repo_name)
+    create_remote_repo(repo_name())
 
     # ── Step 5: push branches ────────────────────────────────────────────────
     confirm_step(
         "Push branches to remote",
-        [
+        details=[
             "Verify .gitignore covers .env before pushing",
             "Connect local repo to origin",
             "Push master branch",
             "Push dev branch",
         ],
     )
-    push_branches(repo_path, repo_name)
+    push_branches(repo_path, repo_name())
 
     # ── Step 6: project board ────────────────────────────────────────────────
     confirm_step(
         "Create GitHub Project board",
-        [
-            f"Create Projects v2 board titled: {repo_name}",
+        details=lambda: [
+            f"Create Projects v2 board titled: {repo_name()}",
             "Set Status columns: To Do, In Progress, Blocked, Done (via GraphQL)",
         ],
     )
-    project_number, project_id, status_field_id, option_ids = create_project_board(repo_name)
+    project_number, project_id, status_field_id, option_ids = create_project_board(repo_name())
 
     # ── Step 7: labels ───────────────────────────────────────────────────────
     confirm_step(
         "Create epic labels",
-        [f"Create label: {epic}" for epic in data["epics"]],
+        details=[f"Create label: {epic}" for epic in data["epics"]],
     )
-    create_labels(repo_name, data["epics"])
+    create_labels(repo_name(), data["epics"])
 
     # ── Step 8: issues ───────────────────────────────────────────────────────
     confirm_step(
@@ -847,7 +881,7 @@ def main() -> None:
         ],
     )
     create_issues(
-        repo_name,
+        repo_name(),
         data["stories"],
         project_number,
         project_id,
@@ -858,12 +892,12 @@ def main() -> None:
     console.print()
     console.rule("[bold green]All done[/bold green]")
     console.print()
-    console.print(f"  [bold]{repo_name}[/bold] is ready.")
+    console.print(f"  [bold]{repo_name()}[/bold] is ready.")
     console.print(f"  {len(data['stories'])} issues waiting on the board.")
-    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{repo_name}")
+    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{repo_name()}")
     console.print(f"  Board: https://github.com/users/{GITHUB_USERNAME}/projects")
     console.print()
-    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{repo_name} --label {data['epics'][0]}")
+    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{repo_name()} --label {data['epics'][0]}")
     console.print()
 
 
