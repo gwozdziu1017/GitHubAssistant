@@ -82,12 +82,13 @@ No vague language. Every step must be implementable without further clarificatio
 # Patterns that suggest an API key or secret was left in the spec file.
 # Each tuple is (label, regex).
 _SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    ("Anthropic API key",       re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}")),
-    ("OpenAI API key",          re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
-    ("GitHub token",            re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}")),
-    ("Google API key",          re.compile(r"\bAIza[A-Za-z0-9\-_]{35}")),
-    ("AWS access key",          re.compile(r"\bAKIA[A-Z0-9]{16}")),
-    ("Generic high-entropy key",re.compile(r"(?<![a-zA-Z0-9])[A-Za-z0-9+/]{40,}(?![a-zA-Z0-9])")),
+    # Specific known key formats only — generic high-entropy patterns cause too many
+    # false positives on SHA hashes, base64 payloads, and long UUIDs in spec files.
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}")),
+    ("OpenAI API key",    re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
+    ("GitHub token",      re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}")),
+    ("Google API key",    re.compile(r"\bAIza[A-Za-z0-9\-_]{35}")),
+    ("AWS access key",    re.compile(r"\bAKIA[A-Z0-9]{16}")),
 ]
 
 
@@ -114,22 +115,26 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict) -> None:
-    """Persist the cache dict to disk."""
+    """Persist the cache dict to disk, restricted to owner read/write only (0o600)."""
     try:
         CACHE_PATH.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        os.chmod(CACHE_PATH, 0o600)
     except OSError as e:
         console.print(f"[yellow]⚠  Could not save cache: {e}[/yellow]")
 
 
-def get_cached_stories(spec_content: str) -> Optional[dict]:
-    """Return cached Claude response for this spec, or None if not cached."""
+def get_cached_stories(spec_content: str) -> Tuple[Optional[dict], dict]:
+    """
+    Return (cached_data, full_cache_dict).
+    cached_data is the stored response for this spec, or None on a miss.
+    Returning the full cache dict avoids a second read in set_cached_stories.
+    """
     cache = load_cache()
-    return cache.get(_spec_hash(spec_content))
+    return cache.get(_spec_hash(spec_content)), cache
 
 
-def set_cached_stories(spec_content: str, data: dict) -> None:
-    """Store Claude response in cache keyed by spec hash."""
-    cache = load_cache()
+def set_cached_stories(spec_content: str, data: dict, cache: dict) -> None:
+    """Store Claude response in cache keyed by spec hash. Reuses an already-loaded cache dict."""
     cache[_spec_hash(spec_content)] = data
     save_cache(cache)
 
@@ -315,8 +320,8 @@ def read_spec(spec_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_stories(spec_content: str) -> dict:
-    # Check cache before making an API call
-    cached = get_cached_stories(spec_content)
+    # Single cache read — reuse the dict for the write to avoid a second disk read
+    cached, cache = get_cached_stories(spec_content)
     if cached:
         console.print("[green]✓ Using cached epics and stories (spec unchanged)[/green]")
         console.print(f"  Epics: {', '.join(cached.get('epics', []))}")
@@ -385,7 +390,7 @@ def generate_stories(spec_content: str) -> dict:
     console.print(f"[green]✓ Epics generated: {', '.join(epics)}[/green]")
     console.print(f"[green]✓ User stories generated: {len(stories)} total[/green]")
 
-    set_cached_stories(spec_content, data)
+    set_cached_stories(spec_content, data, cache)
     console.print(f"[green]✓ Response cached to {CACHE_PATH}[/green]")
 
     return data
@@ -446,7 +451,13 @@ def remote_has_branches(repo_name: str) -> bool:
     )
     if result.returncode != 0:
         return False
-    branches = {b["name"] for b in json.loads(result.stdout)}
+    branch_list = json.loads(result.stdout)
+    if len(branch_list) == 30:
+        console.print(
+            "[yellow]⚠  Exactly 30 branches returned — GitHub paginates at 30. "
+            "If the repo has more branches, master/dev detection may be unreliable.[/yellow]"
+        )
+    branches = {b["name"] for b in branch_list}
     return "master" in branches and "dev" in branches
 
 
@@ -460,7 +471,13 @@ def get_existing_project(repo_name: str) -> Optional[dict]:
     )
     if result.returncode != 0:
         return None
-    for project in json.loads(result.stdout).get("projects", []):
+    projects = json.loads(result.stdout).get("projects", [])
+    if len(projects) == 30:
+        console.print(
+            "[yellow]⚠  Exactly 30 projects returned — GitHub paginates at 30. "
+            "If you have more projects, an existing board may not be detected.[/yellow]"
+        )
+    for project in projects:
         if project.get("title") == repo_name:
             return project
     return None
@@ -484,19 +501,19 @@ def get_existing_project_fields(project_number: str) -> Tuple[Optional[str], Dic
     return None, {}
 
 
-def repo_has_issues(repo_name: str) -> bool:
-    """Return True if the repo already has at least one issue."""
+def get_existing_issue_titles(repo_name: str) -> set:
+    """Return a set of existing issue titles (all states) for duplicate detection."""
     result = gh(
         "issue", "list",
         "--repo", f"{GITHUB_USERNAME}/{repo_name}",
         "--state", "all",
-        "--limit", "1",
-        "--json", "number",
+        "--limit", "500",
+        "--json", "title",
         check=False,
     )
     if result.returncode != 0:
-        return False
-    return len(json.loads(result.stdout)) > 0
+        return set()
+    return {issue["title"] for issue in json.loads(result.stdout)}
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +527,21 @@ def create_local_repo(repo_name: str, target_dir: Path) -> Path:
     if local_repo_exists(repo_name, target_dir):
         console.print(f"[green]✓ Local repository already exists: {repo_path} — skipping[/green]")
         return repo_path
+
+    # Directory exists but has no .git — warn before touching it
+    if repo_path.exists():
+        console.print(
+            Panel(
+                f"{repo_path} already exists but is not a git repository.\n\n"
+                "Proceeding will run git init inside it and create README.md and .gitignore,\n"
+                "which may overwrite existing files.",
+                title="[bold yellow]⚠  Directory already exists[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+        if not Confirm.ask("  Continue anyway?"):
+            console.print("[yellow]Aborted.[/yellow]")
+            sys.exit(0)
 
     repo_path.mkdir(parents=True, exist_ok=True)
     console.print("[yellow]⠸ Initialising local repository...[/yellow]")
@@ -607,10 +639,25 @@ def push_branches(repo_path: Path, repo_name: str) -> None:
     console.print("[green]✓ Local connected to remote[/green]")
 
     console.print("[yellow]⠸ Pushing branches...[/yellow]")
-    repo.git.push("origin", "master")
-    console.print("[green]✓ master pushed[/green]")
-    repo.git.push("origin", "dev")
-    console.print("[green]✓ dev pushed[/green]")
+    try:
+        repo.git.push("origin", "master")
+        console.print("[green]✓ master pushed[/green]")
+        repo.git.push("origin", "dev")
+        console.print("[green]✓ dev pushed[/green]")
+    except Exception as e:
+        console.print(
+            Panel(
+                f"Git push failed: {e}\n\n"
+                "Common causes:\n"
+                "  • Remote already has commits not in your local branch (non-fast-forward)\n"
+                "  • Authentication failure — run: gh auth status\n"
+                "  • Remote branch is protected\n\n"
+                "Resolve the conflict locally, then re-run the script.",
+                title="[bold red]✗ Push failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -739,13 +786,10 @@ def create_labels(repo_name: str, epics: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def format_issue_body(story: dict) -> str:
-    steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(story["steps"]))
-    deps = (
-        "\n".join(f"- {d}" for d in story["dependencies"])
-        if story["dependencies"]
-        else "None"
-    )
-    dod = "\n".join(f"- {c}" for c in story["definition_of_done"])
+    steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(story.get("steps", [])))
+    raw_deps = story.get("dependencies", [])
+    deps = "\n".join(f"- {d}" for d in raw_deps) if raw_deps else "None"
+    dod = "\n".join(f"- {c}" for c in story.get("definition_of_done", []))
 
     return (
         f"## Description\n{story['description']}\n\n"
@@ -764,9 +808,18 @@ def create_issues(
     status_field_id: str,
     option_ids: dict,
 ) -> None:
-    if repo_has_issues(repo_name):
-        console.print("[green]✓ Issues already exist in repository — skipping[/green]")
+    existing_titles = get_existing_issue_titles(repo_name)
+    pending = [s for s in stories if s.get("title", "") not in existing_titles]
+
+    if not pending:
+        console.print(f"[green]✓ All {len(stories)} issues already exist — skipping[/green]")
         return
+
+    if len(existing_titles) > 0:
+        console.print(
+            f"[yellow]⚠  Resuming: {len(existing_titles)} issues already exist, "
+            f"creating {len(pending)} remaining[/yellow]"
+        )
 
     console.print("[yellow]⠸ Creating issues...[/yellow]")
 
@@ -775,7 +828,7 @@ def create_issues(
         console.print("[red]✗ 'To Do' option ID not found[/red]")
         sys.exit(1)
 
-    for i, story in enumerate(stories, start=1):
+    for i, story in enumerate(pending, start=len(existing_titles) + 1):
         # Create the issue
         result = gh(
             "issue", "create",
@@ -807,7 +860,7 @@ def create_issues(
 
         console.print(f"[green]✓ Issue #{i} created: {story['title']}[/green]")
 
-    console.print(f"[green]✓ All {len(stories)} issues assigned to To Do[/green]")
+    console.print(f"[green]✓ All {len(pending)} issues created and assigned to To Do[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -925,12 +978,9 @@ def main() -> None:
     console.rule("[bold blue]Executing[/bold blue]")
     console.print()
 
-    # Convenience accessors — read from state after all confirmations are done
-    def repo_name() -> str:
-        return str(state["repo_name"])
-
-    def target_dir() -> Path:
-        return Path(str(state["target_dir"]))
+    # Resolve final values from state — nothing mutates state after this point
+    final_repo_name: str = str(state["repo_name"])
+    final_target_dir: Path = Path(state["target_dir"])
 
     # ── Step 3: local repository ─────────────────────────────────────────────
     confirm_step(
@@ -938,14 +988,14 @@ def main() -> None:
         details=repo_step_details,
         on_decline=prompt_repo_details,
     )
-    repo_path = create_local_repo(repo_name(), target_dir())
+    repo_path = create_local_repo(final_repo_name, final_target_dir)
 
     # ── Step 4: remote repository ────────────────────────────────────────────
     confirm_step(
         "Create remote GitHub repository",
         details=remote_step_details,
     )
-    create_remote_repo(repo_name())
+    create_remote_repo(final_repo_name)
 
     # ── Step 5: push branches ────────────────────────────────────────────────
     confirm_step(
@@ -957,24 +1007,24 @@ def main() -> None:
             "Push dev branch",
         ],
     )
-    push_branches(repo_path, repo_name())
+    push_branches(repo_path, final_repo_name)
 
     # ── Step 6: project board ────────────────────────────────────────────────
     confirm_step(
         "Create GitHub Project board",
         details=lambda: [
-            f"Create Projects v2 board titled: {repo_name()}",
+            f"Create Projects v2 board titled: {final_repo_name}",
             "Set Status columns: To Do, In Progress, Blocked, Done (via GraphQL)",
         ],
     )
-    project_number, project_id, status_field_id, option_ids = create_project_board(repo_name())
+    project_number, project_id, status_field_id, option_ids = create_project_board(final_repo_name)
 
     # ── Step 7: labels ───────────────────────────────────────────────────────
     confirm_step(
         "Create epic labels",
         details=[f"Create label: {epic}" for epic in data["epics"]],
     )
-    create_labels(repo_name(), data["epics"])
+    create_labels(final_repo_name, data["epics"])
 
     # ── Step 8: issues ───────────────────────────────────────────────────────
     confirm_step(
@@ -987,7 +1037,7 @@ def main() -> None:
         ],
     )
     create_issues(
-        repo_name(),
+        final_repo_name,
         data["stories"],
         project_number,
         project_id,
@@ -998,12 +1048,12 @@ def main() -> None:
     console.print()
     console.rule("[bold green]All done[/bold green]")
     console.print()
-    console.print(f"  [bold]{repo_name()}[/bold] is ready.")
+    console.print(f"  [bold]{final_repo_name}[/bold] is ready.")
     console.print(f"  {len(data['stories'])} issues waiting on the board.")
-    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{repo_name()}")
+    console.print(f"  Repo:  https://github.com/{GITHUB_USERNAME}/{final_repo_name}")
     console.print(f"  Board: https://github.com/users/{GITHUB_USERNAME}/projects")
     console.print()
-    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{repo_name()} --label {data['epics'][0]}")
+    console.print(f"  Start with:  gh issue list --repo {GITHUB_USERNAME}/{final_repo_name} --label {data['epics'][0]}")
     console.print()
 
 
